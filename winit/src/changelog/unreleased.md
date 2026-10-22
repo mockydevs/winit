@@ -11,6 +11,9 @@ on how to add them:
 ```md
 ### Added
 
+- Add byte and time limits for incoming data transfers, implemented on Wayland.
+- On Wayland, add optional portal file-transfer retrieval after a drop.
+
 - Add `Window::turbo()`, implemented on X11, Wayland, and Web.
 - On X11, add `Window::some_rare_api`.
 - On X11, add `Window::even_more_rare_api`.
@@ -49,6 +52,9 @@ changelog entry.
   the primary selection through the data transfer API on Wayland and X11.
 
 ### Fixed
+
+- On Wayland, retain dropped transfers while a new drag enters, and do not
+  finish unsuccessful transfers.
 
 - On Wayland, recognize UTF-8 text transfers regardless of MIME parameter
   whitespace, quoting, or character case.

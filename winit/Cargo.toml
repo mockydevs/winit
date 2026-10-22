@@ -62,6 +62,7 @@ wayland-csd-adwaita-notitle = ["winit-wayland/csd-adwaita-notitle"]
 wayland-csd-adwaita-notitlebar = ["winit-wayland/csd-adwaita-notitlebar"]
 wayland-csd-adwaita-skrifa = ["winit-wayland/csd-adwaita-skrifa"]
 wayland-dlopen = ["winit-wayland/dlopen"]
+wayland-portal = ["wayland", "winit-wayland/portal"]
 x11 = ["winit-x11"]
 
 [build-dependencies]

@@ -188,6 +188,18 @@ impl TypeHint {
     }
 }
 
+/// Resource limits enforced while receiving a data transfer.
+///
+/// Both limits apply before delivering `DataTransferReceived`; exceeding either
+/// completes the request with an I/O error and closes its receive pipe.
+#[derive(Debug, Clone, Copy)]
+pub struct DataTransferLimits {
+    /// Maximum number of bytes retained for this request.
+    pub max_bytes: usize,
+    /// Maximum elapsed time from requesting the transfer.
+    pub timeout: std::time::Duration,
+}
+
 /// The type of a data transfer.
 ///
 /// [`hint`](TransferType::hint) can be called to get the type in

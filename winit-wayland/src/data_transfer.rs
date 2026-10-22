@@ -8,7 +8,9 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::{fmt, mem};
 
-use calloop::PostAction;
+use calloop::{PostAction, RegistrationToken};
+use calloop::timer::{Timer, TimeoutAction};
+use std::{cell::RefCell, rc::Rc};
 use dpi::{LogicalPosition, PhysicalPosition};
 use foldhash::{HashMap, HashSet};
 use rustix::pipe::{self, PipeFlags};
@@ -48,6 +50,9 @@ use winit_core::window::WindowId;
 
 use crate::state::WinitState;
 use crate::{image_to_buffer, make_data_transfer_id};
+
+#[cfg(feature = "portal")]
+mod portal;
 
 #[derive(Default, Debug, PartialEq, Eq, Clone, Hash)]
 enum Charset {
@@ -177,6 +182,10 @@ impl MimeType {
     }
 
     fn parse(value: String) -> Self {
+        #[cfg(feature = "portal")]
+        if value == "application/vnd.portal.filetransfer" {
+            return Self { mime: value.into(), hint: Some(TypeHint::UriList) };
+        }
         let parsed = value.parse::<mime::Mime>().ok();
         let hint = parsed.as_ref().and_then(|parsed| {
             let charset_ok = parsed
@@ -335,6 +344,16 @@ impl DataOffer {
             Some(mime_type) => Some(mime_type),
             None => {
                 let hint = type_.hint()?;
+                #[cfg(feature = "portal")]
+                if hint == TypeHint::UriList {
+                    if let Some(portal) = self
+                        .mime_types
+                        .iter()
+                        .find(|mime| mime.mime.as_ref() == "application/vnd.portal.filetransfer")
+                    {
+                        return Some(portal);
+                    }
+                }
                 self.mime_types.iter().find(|mime_type| {
                     mime_type.hint().is_some_and(|haystack| haystack.matches(&hint))
                 })
@@ -359,6 +378,14 @@ struct DataFetch {
     window_id: WindowId,
     mime_type: Option<MimeType>,
     buffer: Vec<u8>,
+    max_bytes: usize,
+    timer: Option<RegistrationToken>,
+    #[cfg(feature = "portal")]
+    portal_bytes: Option<Vec<u8>>,
+    #[cfg(feature = "portal")]
+    resolve_portal: bool,
+    #[cfg(feature = "portal")]
+    portal_channel: Option<RegistrationToken>,
 }
 
 impl DataFetch {
@@ -368,21 +395,72 @@ impl DataFetch {
         mime_type: MimeType,
         window_id: WindowId,
     ) -> Self {
-        Self { id, serial, window_id, mime_type: Some(mime_type), buffer: Vec::new() }
+        Self {
+            id,
+            serial,
+            window_id,
+            mime_type: Some(mime_type),
+            buffer: Vec::new(),
+            max_bytes: usize::MAX,
+            timer: None,
+            #[cfg(feature = "portal")]
+            portal_bytes: None,
+            #[cfg(feature = "portal")]
+            resolve_portal: false,
+            #[cfg(feature = "portal")]
+            portal_channel: None,
+        }
     }
 
     fn read(&mut self, file: &mut impl io::Read, state: &mut WinitState) -> PostAction {
-        let result = match file.read_to_end(&mut self.buffer) {
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+        // Limit each dispatch as well as total storage: an always-writing source
+        // must not monopolize the event loop.
+        let mut chunk = [0u8; 16 * 1024];
+        let result = match file.read(&mut chunk) {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
                 return PostAction::Continue;
             },
             Ok(0) => Ok(mem::take(&mut self.buffer)),
-            Ok(_) => {
+            Ok(n) if n <= self.max_bytes.saturating_sub(self.buffer.len()) => {
+                self.buffer.extend_from_slice(&chunk[..n]);
                 return PostAction::Continue;
+            },
+            Ok(_) => {
+                Err(Arc::new(io::Error::new(ErrorKind::InvalidData, "transfer exceeds byte limit")))
             },
             Err(e) => Err(Arc::new(e)),
         };
+        #[cfg(feature = "portal")]
+        if self.resolve_portal {
+            if let Ok(bytes) = result {
+                self.portal_bytes = Some(bytes);
+                return PostAction::Remove;
+            }
+        }
+        self.complete(result, state);
+        PostAction::Remove
+    }
 
+    fn complete(&mut self, result: Result<Vec<u8>, Arc<io::Error>>, state: &mut WinitState) {
+        let result = result.and_then(|bytes| {
+            if bytes.len() <= self.max_bytes {
+                Ok(bytes)
+            } else {
+                Err(Arc::new(io::Error::new(ErrorKind::InvalidData, "transfer exceeds byte limit")))
+            }
+        });
+        if self.mime_type.is_none() {
+            return;
+        }
+        #[cfg(feature = "portal")]
+        if let Some(channel) = self.portal_channel.take() {
+            state.loop_handle.remove(channel);
+        }
+        if let Some(timer) = self.timer.take() {
+            state.loop_handle.remove(timer);
+        }
+
+        let succeeded = result.is_ok();
         state.events_sink.push_window_event(
             WindowEvent::DataTransferReceived {
                 id: self.id,
@@ -395,9 +473,7 @@ impl DataFetch {
 
         state.dispatched_events = true;
 
-        state.data_transfer_state.fetch_completed(self.id, self.serial);
-
-        PostAction::Remove
+        state.data_transfer_state.fetch_completed(self.id, self.serial, succeeded);
     }
 }
 
@@ -421,9 +497,13 @@ impl Session<'_> {
         }
     }
 
-    fn fetch_completed(self, serial: AsyncRequestSerial) {
+    fn fetch_completed(self, serial: AsyncRequestSerial, succeeded: bool) {
         let fetches = match self {
-            Session::Drag(session) => &mut session.fetches,
+            Session::Drag(session) => {
+                session.failed |= !succeeded;
+                session.received |= succeeded;
+                &mut session.fetches
+            },
             Session::Clipboard(session) => &mut session.fetches,
         };
 
@@ -435,6 +515,7 @@ impl Session<'_> {
 #[derive(Debug, Default)]
 pub struct DataTransferState {
     drags: HashMap<ObjectId, DragSession>,
+    finishing_drags: Vec<DragSession>,
     clipboards: HashMap<ObjectId, ClipboardSession>,
     primary_selections: HashMap<ObjectId, ClipboardSession>,
     send_drag: Option<DragSource>,
@@ -445,7 +526,12 @@ pub struct DataTransferState {
 
 impl DataTransferState {
     fn session_mut(&mut self, id: DataTransferId) -> Option<Session<'_>> {
-        if let Some(session) = self.drags.values_mut().find(|drag| drag.data.transfer_id() == id) {
+        if let Some(session) = self
+            .drags
+            .values_mut()
+            .chain(self.finishing_drags.iter_mut())
+            .find(|drag| drag.data.transfer_id() == id)
+        {
             return Some(Session::Drag(session));
         }
 
@@ -456,9 +542,9 @@ impl DataTransferState {
             .map(Session::Clipboard)
     }
 
-    fn fetch_completed(&mut self, id: DataTransferId, serial: AsyncRequestSerial) {
+    fn fetch_completed(&mut self, id: DataTransferId, serial: AsyncRequestSerial, succeeded: bool) {
         if let Some(session) = self.session_mut(id) {
-            session.fetch_completed(serial);
+            session.fetch_completed(serial, succeeded);
         }
     }
 
@@ -482,6 +568,20 @@ impl WinitState {
         id: DataTransferId,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, TransferError> {
+        self.fetch_data_transfer_with_limits(id, type_, None)
+    }
+
+    pub(crate) fn fetch_data_transfer_with_limits(
+        &mut self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+        limits: Option<winit_core::data_transfer::DataTransferLimits>,
+    ) -> Result<AsyncRequestSerial, TransferError> {
+        if limits
+            .is_some_and(|limits| std::time::Instant::now().checked_add(limits.timeout).is_none())
+        {
+            return Err(TransferError::Failed);
+        }
         let Some(session) = self.data_transfer_state.session_mut(id) else {
             return Err(TransferError::UnknownTransfer(id));
         };
@@ -489,6 +589,13 @@ impl WinitState {
         let Some(mime_type) = session.data().find_type_dyn(type_).cloned() else {
             return Err(TransferError::Failed);
         };
+
+        #[cfg(feature = "portal")]
+        if mime_type.mime.as_ref() == "application/vnd.portal.filetransfer"
+            && matches!(&session, Session::Drag(drag) if drag.phase == Phase::Hovering)
+        {
+            return Err(TransferError::Failed);
+        }
 
         let window_id = match &session {
             Session::Drag(session) => session.window_id,
@@ -508,6 +615,10 @@ impl WinitState {
             },
         };
 
+        #[cfg(feature = "portal")]
+        let resolve_portal = mime_type.mime.as_ref() == "application/vnd.portal.filetransfer"
+            && type_.cast_ref::<MimeType>().is_none()
+            && type_.hint() == Some(TypeHint::UriList);
         let mime_type_str = mime_type.to_string();
 
         let (readfd, writefd) =
@@ -515,16 +626,57 @@ impl WinitState {
 
         let async_request_serial = AsyncRequestSerial::get();
 
-        let mut fetch = DataFetch::new(id, async_request_serial, mime_type, window_id);
-
-        self.loop_handle
+        let fetch =
+            Rc::new(RefCell::new(DataFetch::new(id, async_request_serial, mime_type, window_id)));
+        #[cfg(feature = "portal")]
+        {
+            fetch.borrow_mut().resolve_portal = resolve_portal;
+        }
+        if let Some(limits) = limits {
+            fetch.borrow_mut().max_bytes = limits.max_bytes;
+        }
+        let receive = Rc::clone(&fetch);
+        let read_token = self
+            .loop_handle
             .insert_source(ReadPipe::from(readfd), move |_, file, state| {
-                // SAFETY: We do not overwrite the referent of `file`
+                // SAFETY: We do not overwrite the referent of `file`.
                 let file = unsafe { file.get_mut() };
-
-                fetch.read(file, state)
+                let action = receive.borrow_mut().read(file, state);
+                #[cfg(feature = "portal")]
+                {
+                    let bytes = receive.borrow_mut().portal_bytes.take();
+                    if let Some(bytes) = bytes {
+                        portal::resolve(Rc::clone(&receive), bytes, state);
+                    }
+                }
+                action
             })
             .map_err(|err| os_error!(io::Error::other(err.to_string())))?;
+        if let Some(limits) = limits {
+            let timeout_fetch = Rc::clone(&fetch);
+            match self.loop_handle.insert_source(
+                Timer::from_duration(limits.timeout),
+                move |_, _, state| {
+                    state.loop_handle.remove(read_token);
+                    let mut fetch = timeout_fetch.borrow_mut();
+                    fetch.timer = None;
+                    fetch.complete(
+                        Err(Arc::new(io::Error::new(
+                            ErrorKind::TimedOut,
+                            "transfer deadline expired",
+                        ))),
+                        state,
+                    );
+                    TimeoutAction::Drop
+                },
+            ) {
+                Ok(token) => fetch.borrow_mut().timer = Some(token),
+                Err(err) => {
+                    self.loop_handle.remove(read_token);
+                    return Err(os_error!(io::Error::other(err.to_string())).into());
+                },
+            }
+        }
 
         session.start_fetch(mime_type_str, writefd, async_request_serial);
 
@@ -871,6 +1023,8 @@ struct DragSession {
     source_actions: WlDndAction,
     selected_action: WlDndAction,
     accepted: bool,
+    failed: bool,
+    received: bool,
     fetches: HashSet<AsyncRequestSerial>,
     phase: Phase,
 }
@@ -896,6 +1050,8 @@ impl DragSession {
             source_actions,
             selected_action: WlDndAction::empty(),
             accepted: false,
+            failed: false,
+            received: false,
             fetches: HashSet::default(),
             phase: Phase::Hovering,
         }
@@ -952,7 +1108,12 @@ impl DragSession {
     }
 
     fn conclude(self) {
-        if self.accepted && !self.selected_action.is_empty() && self.offer.version() >= 3 {
+        if self.accepted
+            && self.received
+            && !self.failed
+            && !self.selected_action.is_empty()
+            && self.offer.version() >= 3
+        {
             self.offer.finish();
         }
         self.offer.destroy();
@@ -1083,7 +1244,7 @@ impl WinitState {
 
 impl DataTransferState {
     pub(crate) fn settle_drops(&mut self) {
-        for session in self.drags.values_mut() {
+        for session in self.drags.values_mut().chain(self.finishing_drags.iter_mut()) {
             if session.phase == Phase::Dropped {
                 session.phase = Phase::Concluding;
             }
@@ -1098,6 +1259,13 @@ impl DataTransferState {
 
         for device in concluded {
             self.drags.remove(&device).unwrap().conclude();
+        }
+        for session in mem::take(&mut self.finishing_drags) {
+            if session.ready_to_conclude() {
+                session.conclude();
+            } else {
+                self.finishing_drags.push(session);
+            }
         }
     }
 
@@ -1186,7 +1354,15 @@ impl DataDeviceHandler for WinitState {
         session.set_actions(&[]);
 
         if let Some(old) = self.data_transfer_state.drags.insert(device, session) {
-            old.abort();
+            if old.ready_to_conclude() {
+                old.conclude();
+            } else if old.phase != Phase::Hovering {
+                // Keep dropped offers available until the application has handled Drop and
+                // any requested bytes have arrived, even if the next drag enters meanwhile.
+                self.data_transfer_state.finishing_drags.push(old);
+            } else {
+                old.abort();
+            }
         }
 
         let scale_factor = self

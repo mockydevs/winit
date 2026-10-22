@@ -231,6 +231,20 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
         Err(DATA_TRANSFER_NOT_SUPPORTED)
     }
 
+    /// Fetch a transfer with a byte cap and a deadline.
+    ///
+    /// A backend that cannot enforce both limits returns an unsupported error;
+    /// it must not silently fall back to an unlimited request.
+    fn fetch_data_transfer_with_limits(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+        limits: crate::data_transfer::DataTransferLimits,
+    ) -> Result<AsyncRequestSerial, TransferError> {
+        let _ = (id, type_, limits);
+        Err(DATA_TRANSFER_NOT_SUPPORTED)
+    }
+
     /// Get a [data transfer](DataTransfer) by its ID.
     ///
     /// If the ID is invalid (e.g. if the lifetime of the data transfer has expired), this will

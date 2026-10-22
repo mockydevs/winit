@@ -10,6 +10,7 @@ version.workspace = true
 
 [features]
 default = ["dlopen", "csd-adwaita"]
+portal = ["dep:dbus", "dep:url"]
 
 csd-adwaita = ["sctk-adwaita", "sctk-adwaita/ab_glyph"]
 csd-adwaita-cosmic-text = ["sctk-adwaita", "sctk-adwaita/cosmic-text"]
@@ -23,6 +24,7 @@ serde = ["dep:serde", "bitflags/serde", "smol_str/serde", "dpi/serde"]
 [dependencies]
 bitflags.workspace = true
 cursor-icon.workspace = true
+dbus = { version = "0.9.12", features = ["stdfd"], optional = true }
 dpi.workspace = true
 mime = "0.3.17"
 percent-encoding.workspace = true
@@ -30,6 +32,7 @@ rwh_06.workspace = true
 serde = { workspace = true, optional = true }
 smol_str.workspace = true
 tracing.workspace = true
+url = { version = "2.5", optional = true }
 winit-core.workspace = true
 
 # Platform-specific

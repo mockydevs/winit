@@ -790,6 +790,15 @@ impl RootActiveEventLoop for ActiveEventLoop {
         self.state.borrow_mut().fetch_data_transfer(id, type_)
     }
 
+    fn fetch_data_transfer_with_limits(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+        limits: winit_core::data_transfer::DataTransferLimits,
+    ) -> Result<AsyncRequestSerial, TransferError> {
+        self.state.borrow_mut().fetch_data_transfer_with_limits(id, type_, Some(limits))
+    }
+
     fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, TransferError> {
         self.state.borrow_mut().data_transfer(id)
     }
